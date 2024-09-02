@@ -6,6 +6,10 @@
 
 use std::sync::Arc;
 
+use display::TopicMetadata;
+use fluvio::consumer::ConsumerOffset;
+use fluvio_sc_schema::objects::{ListRequest, Metadata};
+use fluvio_sc_schema::partition::PartitionSpec;
 use tracing::debug;
 use clap::Parser;
 use anyhow::Result;
@@ -37,17 +41,43 @@ impl DescribeTopicsOpt {
         debug!("describe topic: {}, {:?}", topic, output_type);
 
         let admin = fluvio.admin().await;
-        let topics = admin.list::<TopicSpec, _>(vec![topic]).await?;
+        let topics = admin.list::<TopicSpec, _>(vec![topic.clone()]).await?;
 
-        display::describe_topics(topics, output_type, out).await?;
+        let consumers: Vec<ConsumerOffset> = fluvio.consumer_offsets().await?;
+
+        let partitions: Vec<Metadata<PartitionSpec>> = admin
+            .list_with_config::<PartitionSpec, String>(ListRequest::default().system(false))
+            .await?;
+
+        // let topic_list: Vec<TopicMetadata> = Vec::new();
+
+        let topic_list = topics
+            .into_iter()
+            .map(|m| {
+                let consumers: Vec<ConsumerOffset> = consumers
+                    .iter()
+                    .filter(|consumer| consumer.topic == topic)
+                    .map(|el| el.clone())
+                    .collect();
+                let partitions: Vec<Metadata<PartitionSpec>> = partitions
+                    .iter()
+                    .filter(|partition| partition.name == topic)
+                    .map(|el| el.clone())
+                    .collect();
+                TopicMetadata::new(m, partitions, consumers)
+            })
+            .collect();
+
+        display::describe_topics(topic_list, output_type, out).await?;
         Ok(())
     }
 }
 
 mod display {
 
-    use fluvio::metadata::topic::ReplicaSpec;
+    use fluvio::{consumer::ConsumerOffset, metadata::topic::ReplicaSpec};
     use comfy_table::Row;
+    use fluvio_sc_schema::partition::PartitionSpec;
     use humantime::format_duration;
     use serde::Serialize;
 
@@ -62,19 +92,36 @@ mod display {
     #[allow(clippy::redundant_closure)]
     // Connect to Kafka Controller and query server for topic
     pub async fn describe_topics<O>(
-        topics: Vec<Metadata<TopicSpec>>,
+        topic_list: Vec<TopicMetadata>,
         output_type: OutputType,
         out: std::sync::Arc<O>,
     ) -> Result<(), OutputError>
     where
         O: Terminal,
     {
-        let topic_list: Vec<TopicMetadata> = topics.into_iter().map(|m| TopicMetadata(m)).collect();
         out.describe_objects(&topic_list, output_type)
     }
 
     #[derive(Serialize, Clone)]
-    struct TopicMetadata(Metadata<TopicSpec>);
+    pub struct TopicMetadata {
+        topic_spec: Metadata<TopicSpec>,
+        partitions: Vec<Metadata<PartitionSpec>>,
+        consumers: Vec<ConsumerOffset>,
+    }
+
+    impl TopicMetadata {
+        pub fn new(
+            topic_spec: Metadata<TopicSpec>,
+            partitions: Vec<Metadata<PartitionSpec>>,
+            consumers: Vec<ConsumerOffset>,
+        ) -> Self {
+            Self {
+                topic_spec,
+                partitions,
+                consumers,
+            }
+        }
+    }
 
     impl DescribeObjectHandler for TopicMetadata {
         fn label() -> &'static str {
@@ -116,10 +163,10 @@ mod display {
         /// key value hash map implementation
         fn key_values(&self) -> Vec<(String, Option<String>)> {
             let mut key_values = Vec::new();
-            let spec = &self.0.spec;
-            let status = &self.0.status;
+            let spec = &self.topic_spec.spec;
+            let status = &self.topic_spec.status;
 
-            key_values.push(("Name".to_owned(), Some(self.0.name.clone())));
+            key_values.push(("Name".to_owned(), Some(self.topic_spec.name.clone())));
             key_values.push(("Type".to_owned(), Some(spec.type_label().to_string())));
             match spec.replicas() {
                 ReplicaSpec::Computed(param) => {
