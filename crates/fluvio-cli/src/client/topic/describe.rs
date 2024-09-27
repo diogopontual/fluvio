@@ -6,15 +6,16 @@
 
 use std::sync::Arc;
 
-use display::TopicMetadata;
-use fluvio::consumer::ConsumerOffset;
+use display::{PartitionDetails, TopicMetadata};
+use fluvio::consumer::{ConsumerConfigExtBuilder, ConsumerOffset};
+use fluvio_future::io::StreamExt;
 use fluvio_sc_schema::objects::{ListRequest, Metadata};
-use fluvio_sc_schema::partition::PartitionSpec;
+use fluvio_sc_schema::partition::{PartitionSpec, PartitionSpecUtils};
 use tracing::debug;
 use clap::Parser;
 use anyhow::Result;
-
-use fluvio::Fluvio;
+use futures_util::future::join_all;
+use fluvio::{Fluvio, Offset};
 use fluvio::metadata::topic::TopicSpec;
 
 use crate::common::output::Terminal;
@@ -42,32 +43,59 @@ impl DescribeTopicsOpt {
 
         let admin = fluvio.admin().await;
         let topics = admin.list::<TopicSpec, _>(vec![topic.clone()]).await?;
-
-        let consumers: Vec<ConsumerOffset> = fluvio.consumer_offsets().await?;
-
+        let consumers: Vec<ConsumerOffset> = fluvio.consumer_offsets().await.unwrap();
         let partitions: Vec<Metadata<PartitionSpec>> = admin
             .list_with_config::<PartitionSpec, String>(ListRequest::default().system(false))
-            .await?;
+            .await
+            .unwrap();
 
-        // let topic_list: Vec<TopicMetadata> = Vec::new();
-
-        let topic_list = topics
+        let futures: Vec<_> = topics
             .into_iter()
-            .map(|m| {
-                let consumers: Vec<ConsumerOffset> = consumers
-                    .iter()
-                    .filter(|consumer| consumer.topic == topic)
-                    .map(|el| el.clone())
-                    .collect();
-                let partitions: Vec<Metadata<PartitionSpec>> = partitions
-                    .iter()
-                    .filter(|partition| partition.name == topic)
-                    .map(|el| el.clone())
-                    .collect();
-                TopicMetadata::new(m, partitions, consumers)
+            .map(|m| async {
+                let mut topic_partitions: Vec<PartitionDetails> = Vec::new();
+                //Iterating over paritions to create the pastitions set
+                for partition in &partitions {
+                    let (partition_topic, partition_idx) =
+                        PartitionSpecUtils::split_name(&partition.name);
+                    if partition_topic != topic {
+                        continue;
+                    }
+                    let consumers: Vec<String> = consumers
+                        .iter()
+                        .filter(|consumer| consumer.topic == topic)
+                        .map(|el| el.consumer_id.clone())
+                        .collect();
+                    //Loading last-produced
+                    let mut builder = ConsumerConfigExtBuilder::default();
+                    let mut stream = fluvio
+                        .consumer_with_config(
+                            builder
+                                .topic(topic.to_string())
+                                .partition(partition_idx)
+                                .offset_strategy(fluvio::consumer::OffsetManagementStrategy::None)
+                                .offset_start(Offset::from_end(1))
+                                .build()
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    let n: std::result::Result<fluvio::consumer::Record, fluvio_protocol::link::ErrorCode> = stream.next().await.unwrap();
+                    let last_produced = n.unwrap().timestamp();  
+                    let last_produced_u64 = last_produced.max(0) as u64;              
+                    // admin.create_with_config(config, spec)
+                    topic_partitions.push(PartitionDetails::new(
+                        partition_idx,
+                        partition.status.leader.leo,
+                        last_produced_u64,
+                        consumers,
+                    ));
+                }
+
+                TopicMetadata::new(m, topic_partitions)
             })
             .collect();
 
+        let topic_list = join_all(futures).await;
         display::describe_topics(topic_list, output_type, out).await?;
         Ok(())
     }
@@ -75,9 +103,10 @@ impl DescribeTopicsOpt {
 
 mod display {
 
-    use fluvio::{consumer::ConsumerOffset, metadata::topic::ReplicaSpec};
-    use comfy_table::Row;
-    use fluvio_sc_schema::partition::PartitionSpec;
+    use std::time::{Duration, SystemTime};
+
+    use fluvio::metadata::topic::ReplicaSpec;
+    use comfy_table::{Cell, Row};
     use humantime::format_duration;
     use serde::Serialize;
 
@@ -105,20 +134,38 @@ mod display {
     #[derive(Serialize, Clone)]
     pub struct TopicMetadata {
         topic_spec: Metadata<TopicSpec>,
-        partitions: Vec<Metadata<PartitionSpec>>,
-        consumers: Vec<ConsumerOffset>,
+        partitions: Vec<PartitionDetails>,
+    }
+
+    #[derive(Serialize, Clone, Debug)]
+    pub struct PartitionDetails {
+        partition: u32,
+        last_offset: i64,
+        last_produced: u64,
+        consumers: Vec<String>,
+    }
+
+    impl PartitionDetails {
+        pub fn new(
+            partition: u32,
+            last_offset: i64,
+            last_produced: u64,
+            consumers: Vec<String>,
+        ) -> Self {
+            Self {
+                partition,
+                last_offset,
+                last_produced,
+                consumers,
+            }
+        }
     }
 
     impl TopicMetadata {
-        pub fn new(
-            topic_spec: Metadata<TopicSpec>,
-            partitions: Vec<Metadata<PartitionSpec>>,
-            consumers: Vec<ConsumerOffset>,
-        ) -> Self {
+        pub fn new(topic_spec: Metadata<TopicSpec>, partitions: Vec<PartitionDetails>) -> Self {
             Self {
                 topic_spec,
                 partitions,
-                consumers,
             }
         }
     }
@@ -147,7 +194,7 @@ mod display {
 
     impl TableOutputHandler for TopicMetadata {
         fn header(&self) -> Row {
-            Row::new()
+            Row::from(["PARTITION", "LAST-OFFSET", "LAST-PRODUCED", "CONSUMERS"])
         }
 
         fn errors(&self) -> Vec<String> {
@@ -155,7 +202,27 @@ mod display {
         }
 
         fn content(&self) -> Vec<Row> {
-            vec![]
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let partitions = self.partitions.clone();
+            // list.sort();
+            partitions
+                .into_iter()
+                .map(|partition| {
+                    println!("{:?} : {:?}", now, partition.last_produced);
+                    let last_produced = humantime::Duration::from(Duration::from_millis(
+                        (now as u64) - partition.last_produced,
+                    ));
+                    Row::from([
+                        Cell::new(partition.partition),
+                        Cell::new(partition.last_offset),
+                        Cell::new(last_produced),
+                        Cell::new(partition.consumers.join(", ")),
+                    ])
+                })
+                .collect()
         }
     }
 

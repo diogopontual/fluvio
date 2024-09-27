@@ -5,7 +5,10 @@
 //!
 //!
 use fluvio_types::SpuId;
-use fluvio_protocol::{Encoder, Decoder};
+use fluvio_protocol::{
+    record::{PartitionError, ReplicaKey},
+    Decoder, Encoder,
+};
 
 use crate::topic::{CleanupPolicy, CompressionAlgorithm, Deduplication, TopicSpec, TopicStorageConfig};
 
@@ -201,5 +204,25 @@ impl std::fmt::Display for RemotePartitionConfig {
             "{}:{}:{}",
             self.home_cluster, self.home_spu_id, self.home_spu_endpoint
         )
+    }
+}
+
+pub struct PartitionSpecUtils;
+
+impl PartitionSpecUtils {
+    /// Splits a partition name into its topics and partitions components
+    /// # Arguments
+    /// * `name` - The name of the partition
+    /// # Returns
+    /// A tuple containing the topic and partition components of the partition name
+    pub fn split_name(name: &String) -> (String, u32) {
+        let parse_key: Result<ReplicaKey, PartitionError> = name.clone().try_into();
+        match parse_key {
+            Ok(key) => {
+                let (topic, partition) = key.split();
+                (topic, partition)
+            }
+            Err(err) => (err.to_string(), u32::MAX),
+        }
     }
 }
