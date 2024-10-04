@@ -62,7 +62,9 @@ impl DescribeTopicsOpt {
                     }
                     let consumers: Vec<String> = consumers
                         .iter()
-                        .filter(|consumer| consumer.topic == topic)
+                        .filter(|consumer| {
+                            consumer.topic == topic && consumer.partition == partition_idx
+                        })
                         .map(|el| el.consumer_id.clone())
                         .collect();
                     //Loading last-produced
@@ -72,6 +74,7 @@ impl DescribeTopicsOpt {
                             builder
                                 .topic(topic.to_string())
                                 .partition(partition_idx)
+                                .disable_continuous(true)
                                 .offset_strategy(fluvio::consumer::OffsetManagementStrategy::None)
                                 .offset_start(Offset::from_end(1))
                                 .build()
@@ -79,9 +82,18 @@ impl DescribeTopicsOpt {
                         )
                         .await
                         .unwrap();
-                    let n: std::result::Result<fluvio::consumer::Record, fluvio_protocol::link::ErrorCode> = stream.next().await.unwrap();
-                    let last_produced = n.unwrap().timestamp();  
-                    let last_produced_u64 = last_produced.max(0) as u64;              
+                    // let n: std::result::Result<fluvio::consumer::Record, fluvio_protocol::link::ErrorCode> = stream.next().await;
+                    let last_produced = match stream.next().await {
+                        Some(Ok(n)) => n.timestamp(),
+                        Some(Err(e)) => {
+                            debug!("error: {}", e);
+                            0
+                        }
+                        None => 0,
+                    };
+
+                    let last_produced_u64 = last_produced.max(0) as u64;
+                    println!("last_produced: {}", last_produced_u64);
                     // admin.create_with_config(config, spec)
                     topic_partitions.push(PartitionDetails::new(
                         partition_idx,
@@ -211,10 +223,14 @@ mod display {
             partitions
                 .into_iter()
                 .map(|partition| {
-                    println!("{:?} : {:?}", now, partition.last_produced);
-                    let last_produced = humantime::Duration::from(Duration::from_millis(
-                        (now as u64) - partition.last_produced,
-                    ));
+                    let last_produced = match partition.last_produced {
+                        0 => "".to_string(),
+                        _ => humantime::Duration::from(Duration::from_millis(
+                            (now as u64) - partition.last_produced,
+                        ))
+                        .to_string(),
+                    };
+
                     Row::from([
                         Cell::new(partition.partition),
                         Cell::new(partition.last_offset),
@@ -231,33 +247,17 @@ mod display {
         fn key_values(&self) -> Vec<(String, Option<String>)> {
             let mut key_values = Vec::new();
             let spec = &self.topic_spec.spec;
-            let status = &self.topic_spec.status;
 
             key_values.push(("Name".to_owned(), Some(self.topic_spec.name.clone())));
-            key_values.push(("Type".to_owned(), Some(spec.type_label().to_string())));
             match spec.replicas() {
                 ReplicaSpec::Computed(param) => {
                     key_values.push((
-                        "Partition Count".to_owned(),
-                        Some(param.partitions.to_string()),
-                    ));
-                    key_values.push((
-                        "Replication Factor".to_owned(),
+                        "Replication".to_owned(),
                         Some(param.replication_factor.to_string()),
                     ));
-                    key_values.push((
-                        "Ignore Rack Assignment".to_owned(),
-                        Some(param.ignore_rack_assignment.to_string()),
-                    ));
+                    key_values.push(("Partitions".to_owned(), Some(param.partitions.to_string())));
                 }
-                ReplicaSpec::Assigned(_partitions) => {
-                    /*
-                    key_values.push((
-                        "Assigned Partitions".to_owned(),
-                        Some(partitions.maps.clone()),
-                    ));
-                    */
-                }
+                ReplicaSpec::Assigned(_partitions) => {}
                 ReplicaSpec::Mirror(_config) => {}
             }
 
@@ -278,14 +278,6 @@ mod display {
                     dedup.bounds.age.map(|a| format_duration(a).to_string()),
                 ));
             };
-
-            key_values.push((
-                "Status".to_owned(),
-                Some(status.resolution.resolution_label().to_string()),
-            ));
-            key_values.push(("Reason".to_owned(), Some(status.reason.clone())));
-
-            key_values.push(("-----------------".to_owned(), None));
 
             key_values
         }
